@@ -213,21 +213,28 @@ class Pooling(Module):
                     output_vectors.append(mean_sum / torch.sqrt(mean_mask))
 
             elif mode == "weightedmean":
-                mask = attention_mask.unsqueeze(-1).expand_as(token_embeddings).to(token_embeddings.dtype)
+                pooling_dtype = (
+                    torch.float32
+                    if token_embeddings.dtype in (torch.float16, torch.bfloat16)
+                    else token_embeddings.dtype
+                )
+                mask = attention_mask.unsqueeze(-1).expand_as(token_embeddings).to(pooling_dtype)
                 weights = (
                     torch.arange(start=1, end=token_embeddings.shape[1] + 1, device=token_embeddings.device)
                     .unsqueeze(0)
                     .unsqueeze(-1)
                     .expand_as(token_embeddings)
-                    .to(token_embeddings.dtype)
+                    .to(pooling_dtype)
                 )
                 weighted_mask = mask * weights
                 sum_embeddings = (token_embeddings * weighted_mask).sum(dim=1)
+                output_dtype = token_embeddings.dtype
                 if "token_weights_sum" in features:
                     sum_mask = features["token_weights_sum"].unsqueeze(-1).expand_as(sum_embeddings)
+                    output_dtype = torch.promote_types(output_dtype, sum_mask.dtype)
                 else:
                     sum_mask = weighted_mask.sum(dim=1)
-                output_vectors.append(sum_embeddings / torch.clamp(sum_mask, min=1e-9))
+                output_vectors.append((sum_embeddings / torch.clamp(sum_mask, min=1e-9)).to(output_dtype))
 
             elif mode == "lasttoken":
                 bs, seq_len, hidden_dim = token_embeddings.shape
@@ -317,13 +324,16 @@ class Pooling(Module):
                 if token_positions is None:
                     offsets = torch.repeat_interleave(cu_seq_lens_q[:-1], seq_lengths)
                     token_positions = torch.arange(embeddings.shape[0], device=device) - offsets
-                weights = (token_positions + 1).to(embeddings.dtype).unsqueeze(1)
+                pooling_dtype = (
+                    torch.float32 if embeddings.dtype in (torch.float16, torch.bfloat16) else embeddings.dtype
+                )
+                weights = (token_positions + 1).to(pooling_dtype).unsqueeze(1)
                 weighted_emb = embeddings * weights
-                weighted_sum = torch.zeros(num_seqs, hidden_dim, device=device, dtype=embeddings.dtype)
+                weighted_sum = torch.zeros(num_seqs, hidden_dim, device=device, dtype=pooling_dtype)
                 weighted_sum = weighted_sum.index_add(0, segment_ids, weighted_emb)
-                weight_sum = torch.zeros(num_seqs, 1, device=device, dtype=embeddings.dtype)
+                weight_sum = torch.zeros(num_seqs, 1, device=device, dtype=pooling_dtype)
                 weight_sum = weight_sum.index_add(0, segment_ids, weights)
-                output_vectors.append(weighted_sum / torch.clamp(weight_sum, min=1e-9))
+                output_vectors.append((weighted_sum / torch.clamp(weight_sum, min=1e-9)).to(embeddings.dtype))
 
         return output_vectors
 

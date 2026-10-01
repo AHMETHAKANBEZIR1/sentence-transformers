@@ -664,3 +664,58 @@ def test_pooling_flattened_live_flash_attention(pooling_mode: str) -> None:
     assert torch.allclose(ref_embeddings.float(), flash_embeddings.float(), atol=1e-2), (
         f"Embeddings differ for pooling_mode={pooling_mode!r}, max absolute difference: {(ref_embeddings - flash_embeddings).abs().max().item()}"
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("flattened", [False, True])
+@pytest.mark.parametrize("scenario", ["constant", "large_product", "varying", "empty_prompt"])
+def test_weightedmean_low_precision(dtype: torch.dtype, flattened: bool, scenario: str) -> None:
+    length = {"constant": 512, "large_product": 16, "varying": 512, "empty_prompt": 8}[scenario]
+    positions = torch.arange(length, dtype=torch.float64)
+    values = torch.ones(length, 3, dtype=torch.float64)
+    if scenario == "large_product":
+        values *= 4096
+    elif scenario == "varying":
+        values[:, 0] = positions.remainder(5) / 4
+        values[:, 1] = -positions.remainder(7) / 4
+        values[:, 2] = positions.remainder(3) + 1
+    embeddings = values.to(dtype).unsqueeze(0).requires_grad_()
+    original = embeddings.detach().clone()
+    mask = torch.ones(1, length, dtype=torch.long)
+    features = {"token_embeddings": embeddings, "attention_mask": mask}
+    if flattened:
+        features["cu_seq_lens_q"] = torch.tensor([0, length], dtype=torch.int32)
+    if scenario == "empty_prompt":
+        features["prompt_length"] = length
+    pooling = Pooling(3, pooling_mode="weightedmean", include_prompt=False)
+    actual = pooling(features)["sentence_embedding"]
+
+    reference_input = original.double().requires_grad_()
+    weights = torch.arange(1, length + 1, dtype=torch.float64).view(1, length, 1)
+    if scenario == "empty_prompt":
+        weights = torch.zeros_like(weights)
+    expected = (reference_input * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1e-9)
+    assert actual.dtype == dtype
+    torch.testing.assert_close(actual, expected.to(dtype))
+    actual.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(embeddings.grad, reference_input.grad.to(dtype))
+    assert torch.equal(embeddings.detach(), original)
+    assert torch.equal(mask, torch.ones_like(mask))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.float64])
+def test_weightedmean_external_normalizer_dtype(dtype: torch.dtype, weight_dtype: torch.dtype) -> None:
+    embeddings = torch.ones(1, 512, 3, dtype=dtype, requires_grad=True)
+    normalizer = torch.tensor([512 * 513 / 2], dtype=weight_dtype)
+    features = {
+        "token_embeddings": embeddings,
+        "attention_mask": torch.ones(1, 512, dtype=torch.long),
+        "token_weights_sum": normalizer,
+    }
+    actual = Pooling(3, pooling_mode="weightedmean")(features)["sentence_embedding"]
+    assert actual.dtype == torch.promote_types(dtype, weight_dtype)
+    torch.testing.assert_close(actual, torch.ones_like(actual), rtol=0, atol=0)
+    actual.sum().backward()
+    assert torch.isfinite(embeddings.grad).all()
