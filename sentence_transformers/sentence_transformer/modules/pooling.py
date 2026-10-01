@@ -79,6 +79,8 @@ class Pooling(Module):
             a tuple/list of mode names to concatenate multiple pooled representations.
             Valid modes: ``"cls"``, ``"max"``, ``"mean"``, ``"mean_sqrt_len_tokens"``,
             ``"weightedmean"``, ``"lasttoken"``. Defaults to ``"mean"``.
+            For ``"weightedmean"``, position weights start at the first non-padding token.
+            Excluding a prompt retains the remaining tokens' original position weights.
         include_prompt: If ``False``, prompt tokens are excluded from pooling. Useful for
             models like `INSTRUCTOR <https://huggingface.co/hkunlp/instructor-large>`_ that
             should not include the prompt in the pooled representation. Defaults to ``True``.
@@ -214,13 +216,16 @@ class Pooling(Module):
 
             elif mode == "weightedmean":
                 mask = attention_mask.unsqueeze(-1).expand_as(token_embeddings).to(token_embeddings.dtype)
-                weights = (
-                    torch.arange(start=1, end=token_embeddings.shape[1] + 1, device=token_embeddings.device)
-                    .unsqueeze(0)
-                    .unsqueeze(-1)
-                    .expand_as(token_embeddings)
-                    .to(token_embeddings.dtype)
-                )
+                weights = torch.arange(
+                    start=1, end=token_embeddings.shape[1] + 1, device=token_embeddings.device
+                ).unsqueeze(0)
+                # Count positions from the first real token, using the original mask so
+                # excluding a prompt does not reset the remaining tokens' weights.
+                original_mask = features.get("attention_mask")
+                if original_mask is not None and original_mask.shape == attention_mask.shape:
+                    pad_lengths = original_mask.to(torch.int32).argmax(dim=1)
+                    weights = weights - pad_lengths.unsqueeze(1)
+                weights = weights.unsqueeze(-1).expand_as(token_embeddings).to(token_embeddings.dtype)
                 weighted_mask = mask * weights
                 sum_embeddings = (token_embeddings * weighted_mask).sum(dim=1)
                 if "token_weights_sum" in features:
