@@ -121,21 +121,6 @@ def _take(ids: list, value_view, index: _SortedIdIndex | dict, value_col: str, i
     try:
         if isinstance(index, _SortedIdIndex):
             queries = np.asarray(ids)
-            if (
-                index.keys.dtype.kind in "iu"
-                and queries.dtype.kind != index.keys.dtype.kind
-                and all(isinstance(value, (int, np.integer)) for value in ids)
-            ):
-                # Small uint64 IDs infer int64, while mixing them with large IDs can infer float64.
-                # Cast the original Python integers so no precision is lost, checking bounds first
-                # to prevent a negative or oversized ID from wrapping onto a real key.
-                bounds = np.iinfo(index.keys.dtype)
-                for offset, value in enumerate(ids):
-                    if not bounds.min <= int(value) <= bounds.max:
-                        if offset:
-                            index.lookup(np.asarray(ids[:offset], dtype=index.keys.dtype))
-                        raise KeyError(value)
-                queries = np.asarray(ids, dtype=index.keys.dtype)
             if queries.dtype.kind == "O" or queries.dtype.kind != index.keys.dtype.kind:
                 # Mixed / mistyped ids can't hit the typed sorted keys: every id would "miss", so
                 # report the first one as not found, matching the dict path's behaviour.
@@ -424,12 +409,13 @@ def resolve_ids(
             for id_batch in dataset.select_columns([id_col]).iter(batch_size=50_000):
                 id_values.extend(id_batch[id_col])
             keys = np.asarray(id_values)
-            if keys.dtype.kind != "O" and getattr(dataset.features[id_col], "dtype", None) == "uint64":
-                # NumPy may infer float64 from Python integers spanning both sides of 2**63,
-                # rounding distinct uint64 IDs into the same key. Nullable columns keep the dict path.
-                keys = np.asarray(id_values, dtype=np.uint64)
             # numpy pads a string array to its longest id, so past 128 bytes it costs more than the dict.
-            if keys.ndim == 1 and keys.dtype.kind in "iufUS" and keys.itemsize <= 128:
+            if (
+                keys.ndim == 1
+                and keys.dtype.kind in "iufUS"
+                and keys.itemsize <= 128
+                and getattr(dataset.features[id_col], "dtype", None) != "uint64"
+            ):
                 index = _SortedIdIndex(keys)
             else:
                 # Mixed-type, wide, or otherwise non-sortable ids: the dict handles any hashable key.
